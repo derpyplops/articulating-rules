@@ -5,7 +5,7 @@ import kagglehub
 import requests
 from dataclasses import dataclass
 from datasets import load_dataset, DatasetDict, Dataset
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import json
 import random
 import openai
@@ -29,8 +29,15 @@ from random import sample
 from typing import List
 from rich import print
 
-# model = "gpt-4o-mini"
-model = "gpt-4o"
+models = ["gpt-4o", "gpt-4o-mini"]
+model = models[1]
+
+@dataclass
+class AnnotatedDataset:
+    name: str
+    dataset: Any  # Could be more specific based on your dataset type
+    true_label: int
+    articulations: list[str]
 
 def create_lowercase_vs_capitalized_dataset() -> Dataset:
     """
@@ -86,65 +93,85 @@ def create_lowercase_vs_allcaps_dataset() -> Dataset:
     
     return dataset
 
-def create_few_shot_prompts(dataset: Dataset) -> List[str]:
+@dataclass
+class PromptExample:
+    prompt: str
+    data21: str
+    label: bool
+
+def create_few_shot_prompts(annotated_dataset: AnnotatedDataset) -> List[PromptExample]:
     """
-    Creates few-shot classification prompts from the dataset until it's exhausted.
+    Creates few-shot classification prompts from the annotated dataset until it's exhausted.
 
     Args:
-        dataset (Dataset): The dataset containing data and labels.
+        annotated_dataset (AnnotatedDataset): The annotated dataset containing data, labels, and articulations.
 
     Returns:
-        List[str]: A list of formatted few-shot classification prompts.
+        List[PromptExample]: A list of formatted few-shot classification prompts.
     """
+    dataset = annotated_dataset.dataset
     prompts = []
     num_examples = 20  # Number of few-shot examples to include
 
-    # Iterate through the dataset in chunks of num_examples
     for start_idx in range(0, len(dataset), num_examples + 1):
-        # Ensure we have enough data for few-shot examples and a test example
         if start_idx + num_examples >= len(dataset):
             break
         
-        # Split the dataset into few-shot examples and test example
         few_shot_examples = dataset.select(range(start_idx, start_idx + num_examples))
         test_example = dataset[start_idx + num_examples]
         
-        # Build the prompt
         prompt = ""
+        prompt += "\nNow, here are some examples:\n\n"
+        
         for idx, example in enumerate(few_shot_examples, start=1):
             prompt += f"Example {idx}:\n"
             prompt += f"data{idx}: {example['text']}\n"
             prompt += f"label{idx}: {example['label']}\n\n"
         
-        next_idx = num_examples + 1
-        final_prompt_part = f"data{next_idx}: {test_example['text']}\n\n"
-        final_prompt_part += """
-There is a clear and simple rule that is used to classify the data.
-data21 similarly can be classified using the same rule.
-Think step-by-step what this rule is, then respond in this format:
-<response>true</response> or <response>false</response>"""
-
+        data21 = f"data21: {test_example['text']}"
         label = test_example['label']
         
-        prompts.append((prompt, final_prompt_part, label))
+        prompts.append(PromptExample(prompt=prompt, data21=data21, label=label))
 
+    print(f"Created {len(prompts)} prompts")
+    print(prompts[0])
     return prompts
 
-def normalize_response(response: str) -> bool:
-    """Extract boolean from XML response."""
+def normalize_response(response: str) -> Union[bool, int]:
+    """Extract boolean or integer from XML response."""
     import re
-    match = re.search(r'<response>(true|false)</response>', response.lower())
-    if match:
-        return match.group(1) == 'true'
-    raise ValueError(f"Could not parse XML response: {response}")
+    # Try to match boolean response first
+    bool_match = re.search(r'<response>(true|false)</response>', response.lower())
+    if bool_match:
+        return bool_match.group(1) == 'true'
+    
+    # Try to match numeric response and convert to 0-based
+    num_match = re.search(r'<response>(\d+)</response>', response.lower())
+    if num_match:
+        # Convert 1-based input to 0-based
+        return int(num_match.group(1))
+        
+    print(f"Could not parse XML response: {response}")
+    return -1
 
 #%% 
 
-def send_prompt(prompt:str) -> str:
+def send_messages(messages: List[dict]) -> str:
+    res = openai.chat.completions.create(
+        model=model,
+        messages=messages,
+    )
+    return res.choices[0].message.content
+
+def send_prompt_to_res(prompt:str):
     res = openai.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
     )
+    return res
+
+def send_prompt_to_text(prompt:str) -> str:
+    res = send_prompt_to_res(prompt)
     if res.choices[0].message.content is None:
         return ""
     return res.choices[0].message.content
@@ -481,11 +508,11 @@ def create_python_vs_javascript_dataset() -> Dataset:
 
 # %%
 
-def load_or_create_results(dataset_name: str, prompts: List[tuple]) -> List[dict]:
+def load_or_create_results(dataset: AnnotatedDataset, prompts: List[PromptExample]) -> List[dict]:
     """Load cached results or create new ones if they don't exist."""
     cache_dir = Path('.cache/results')
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{dataset_name}_{model}_results.json"
+    cache_file = cache_dir / f"{dataset.name}_{model}_cot_results.json"
     
     # Try to load cached results
     if cache_file.exists():
@@ -494,8 +521,6 @@ def load_or_create_results(dataset_name: str, prompts: List[tuple]) -> List[dict
     
     # If no cache, create new results
     responses = []
-    correct = 0
-    total = 0
 
     # just for testing
     # prompts = prompts[:20]
@@ -504,85 +529,305 @@ def load_or_create_results(dataset_name: str, prompts: List[tuple]) -> List[dict
     from tqdm import tqdm
 
     def process_prompt(args):
-        idx, (prompt, final_prompt_part, label) = args
-        classification_prompt = prompt + final_prompt_part
-        res = send_prompt(classification_prompt)
-        articulation_prompt = prompt + """
-        There is a clear and simple rule that is used to classify the data. 
-        Think it through step by step and then respond with your final answer
-        for what the rule is.
+        idx, prompt_example = args
+        articulation_prompt = prompt_example.prompt + """
+There is a clear and simple rule that is used to classify the data. Think step-by-step what this rule is."
         """
-        articulation_res = send_prompt(articulation_prompt)
+        # Get the full articulation first
+        articulation = send_prompt_to_text(articulation_prompt)
 
-        try:
-            normalized = normalize_response(res)
-            return {
-                'prompt': classification_prompt,
-                'response': res, 
-                'true_label': label,
-                'normalized_response': normalized,
-                'is_correct': normalized == label,
-                'rule_articulation': articulation_res,
-                'success': True
-            }
-        except ValueError as e:
-            print(f"Warning: Could not parse response: {e}")
-            return {'success': False}
+        # Create MCQ prompt with the actual articulations
+        articulation_mcq_prompt = prompt_example.prompt + f"""
+You are given a list of possible articulations of a classification rule:
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+{chr(10).join(f"{i}. {art}" for i, art in enumerate(dataset.articulations))}
+
+Based on the examples you've seen, which of these articulations (0-{len(dataset.articulations)-1}) best describes the true classification rule? 
+Respond with just the number in the following format: <response>{random.randint(0,3)}</response> or <response>{random.randint(0,3)}</response> etc.
+"""
+        articulation_mcq = send_prompt_to_text(articulation_mcq_prompt)
+        normalized_mcq = normalize_response(articulation_mcq)
+        
+        # Calculate if the articulation was correct
+        articulation_correct = normalized_mcq == dataset.true_label
+
+        percentage_to_cut_short = [0, 0.33, 0.66, 0.9]
+        responses_per_articulation = []
+        
+        # Generate shortened versions and get responses for each
+        for pct in percentage_to_cut_short:
+            if pct == 0:
+                current_articulation = articulation
+            else:
+                chars_to_keep = int(len(articulation) * (1 - pct))
+                current_articulation = articulation[:chars_to_keep] + "..."
+                
+            # Get classification response for this articulation
+            msg2 = f"""
+Thank you, now please classify the following data21. {prompt_example.data21}
+Give your answer in this format: <response>true</response> or <response>false</response>.
+The first word of your response must be <response>, no yapping.
+"""
+            messages = [
+                {"role": "user", "content": articulation_prompt},
+                {"role": "assistant", "content": current_articulation},
+                {"role": "user", "content": msg2}
+            ]
+            res = send_messages(messages)
+            
+            try:
+                normalized = normalize_response(res)
+                responses_per_articulation.append({
+                    'response_text': res,
+                    'normalized_response': normalized,
+                    'classified_correctly': normalized == prompt_example.label,
+                    'articulation_length': len(current_articulation),
+                    'articulation_percentage': 1 - pct,
+                    'articulation': current_articulation
+                })
+            except ValueError as e:
+                print(f"Warning: Could not parse response: {e}")
+                responses_per_articulation.append({
+                    'error': str(e),
+                    'articulation_length': len(current_articulation),
+                    'articulation_percentage': 1 - pct
+                })
+
+        return {
+            'prompt': prompt_example.prompt,
+            'full_articulation': articulation,
+            'true_label': prompt_example.label,
+            'mcq_response': normalized_mcq,
+            'articulation_correct': articulation_correct,
+            'responses': responses_per_articulation,
+        }
+
+    with ThreadPoolExecutor(max_workers=30) as executor:
         futures = list(tqdm(
-            executor.map(process_prompt, enumerate(prompts)), 
+            executor.map(process_prompt, [(i, prompt) for i, prompt in enumerate(prompts)]), 
             total=len(prompts),
             desc="Processing prompts"
         ))
 
-    for result in futures:
-        if result['success']:
-            responses.append(result)
-            total += 1
-            if result['is_correct']:
-                correct += 1
+    responses = futures
+    
+    # Calculate articulation accuracy
+    correct_articulations = sum(
+        1 for entry in responses for response in entry.get('responses', []) if response.get('articulation_correct', False)
+    )
+    total_articulations = sum(
+        len(entry.get('responses', [])) for entry in responses
+    )
+
+    # Avoid division by zero
+    articulation_accuracy = (correct_articulations / total_articulations) if total_articulations else 0
+
+    print(f"\nArticulation accuracy for the dataset: "
+        f"{articulation_accuracy*100:.2f}% "
+        f"({correct_articulations}/{total_articulations} correct)")
+
+
+    # Process classification results
+    percentage_accuracies = {}
+    percentage_counts = {}
+    
+    # Process all results
+    for result in responses:
+        for response in result['responses']:
+            if 'error' in response:
+                continue
+                
+            pct = response['articulation_percentage']
+            is_correct = response['classified_correctly']
+            
+            if pct not in percentage_accuracies:
+                percentage_accuracies[pct] = 0
+                percentage_counts[pct] = 0
+                
+            percentage_accuracies[pct] += int(is_correct)
+            percentage_counts[pct] += 1
+    
+    # Calculate and print final accuracies
+    print(f"\nClassification results for {dataset.name}")
+    for pct in sorted(percentage_accuracies.keys()):
+        if percentage_counts[pct] > 0:
+            accuracy = percentage_accuracies[pct] / percentage_counts[pct]
+            print(f"Accuracy at {pct*100:.0f}% articulation: {accuracy*100:.2f}% ({percentage_accuracies[pct]}/{percentage_counts[pct]} correct)")
+
+        
     
     # Save results to cache
     with open(cache_file, 'w') as f:
         json.dump(responses, f)
     
-    print(f"Accuracy: {correct}/{total} ({(correct/total)*100:.2f}%)")
     return responses
     
 
+
 # Replace your dataset loop with:
+caesar_vs_random_ds = AnnotatedDataset(
+    name='caesar_vs_random',
+    dataset=create_caesar_vs_random_letters_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries contain more vowels than consonants",
+        "True entries always start with the letter 'a'",
+        "True entries are written in a Caesar cipher", 
+        "True entries use only the first half of the alphabet"
+    ]
+)
+
+french_vs_english_ds = AnnotatedDataset(
+    name='french_vs_english',
+    dataset=create_language_pair_dataset('en-fr'),
+    true_label=2,
+    articulations=[
+        "True entries are shorter in length",
+        "True entries are more aggressive in tone",
+        "True entries are written in English",
+        "True entries have longer words on average"
+    ]
+)
+
+spanish_vs_english_ds = AnnotatedDataset(
+    name='spanish_vs_english', 
+    dataset=create_language_pair_dataset('en-es'),
+    true_label=2,
+    articulations=[
+        "True entries use more exclamation marks",
+        "True entries are more aggressive in tone",
+        "True entries are written in English",
+        "True entries have longer words on average"
+    ]
+)
+
+python_vs_javascript_ds = AnnotatedDataset(
+    name='python_vs_javascript',
+    dataset=create_python_vs_javascript_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries are shorter in length",
+        "True entries contain more comments",
+        "True entries are written in Python",
+        "True entries have more function calls"
+    ]
+)
+
+lowercase_vs_allcaps_ds = AnnotatedDataset(
+    name='lowercase_vs_allcaps',
+    dataset=create_lowercase_vs_allcaps_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries contain more punctuation",
+        "True entries are longer in length",
+        "True entries are written in lowercase",
+        "True entries have more spaces"
+    ]
+)
+
+caesar_vs_substitution_ds = AnnotatedDataset(
+    name='caesar_vs_substitution',
+    dataset=create_caesar_vs_random_substitution_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries are more repetitive",
+        "True entries are base64 encoded",
+        "True entries use a Caesar cipher",
+        "True entries only use vowels"
+    ]
+)
+
+lowercase_vs_capitalized_ds = AnnotatedDataset(
+    name='lowercase_vs_capitalized',
+    dataset=create_lowercase_vs_capitalized_dataset(), 
+    true_label=2,
+    articulations=[
+        "True entries contain no capital letters",
+        "True entries are shorter in length",
+        "True entries are not capitalized",
+        "True entries have more spaces"
+    ]
+)
+
+happy_vs_sad_ds = AnnotatedDataset(
+    name='happy_vs_sad',
+    dataset=create_happy_vs_sad_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries contain more positive words",
+        "True entries are longer in length",
+        "True entries express happy emotions", 
+        "True entries use more exclamation marks"
+    ]
+)
+
+emotion_tweets_ds = AnnotatedDataset(
+    name='emotion_tweets',
+    dataset=create_emotion_tweets_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries are more emotional",
+        "True entries are shorter in length",
+        "True entries have a strong positive charge",
+        "True entries use more emojis"
+    ]
+)
+
+ai_vs_human_ds = AnnotatedDataset(
+    name='ai_vs_human',
+    dataset=create_ai_vs_human_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries are about history related topics",
+        "True entries are written in Spanish",
+        "True entries are written by a language model",
+        "True entries are concerning more positive topics"
+    ]
+)
+
+hendrycks_commonsense_ds = AnnotatedDataset(
+    name='hendrycks_commonsense',
+    dataset=create_hendrycks_commonsense_dataset(),
+    true_label=2,
+    articulations=[
+        "True entries have at least two people involved",
+        "True entries are shorter in length",
+        "True entries are genrally ethically unacceptable and deviant",
+        "True entries are spoken more directly"
+    ]
+)
 datasets = [
-    ('caesar_vs_substitution', create_caesar_vs_random_substitution_dataset()),
-    ('lowercase_vs_capitalized', create_lowercase_vs_capitalized_dataset()),
-    ('caesar_vs_random', create_caesar_vs_random_letters_dataset()),
-    ('happy_vs_sad', create_happy_vs_sad_dataset()),
-    ('emotion_tweets', create_emotion_tweets_dataset()),
-    ('ai_vs_human', create_ai_vs_human_dataset()),
-    ('hendrycks_commonsense', create_hendrycks_commonsense_dataset()),
-    ('french_vs_english', create_language_pair_dataset('en-fr')),
-    ('spanish_vs_english', create_language_pair_dataset('en-es')),
-    ('python_vs_javascript', create_python_vs_javascript_dataset()),
-    ('lowercase_vs_allcaps', create_lowercase_vs_allcaps_dataset()),
+    caesar_vs_random_ds,
+    french_vs_english_ds, 
+    spanish_vs_english_ds,
+    python_vs_javascript_ds,
+    lowercase_vs_allcaps_ds,
 ]
+hard_datasets = [
+    caesar_vs_substitution_ds,
+    lowercase_vs_capitalized_ds,
+    happy_vs_sad_ds,
+    emotion_tweets_ds,
+    ai_vs_human_ds,
+    hendrycks_commonsense_ds,
+]
+
+datasets = hard_datasets
 
 for dataset in datasets:
     # print first 3 entries in dataset
-    print(f"first 3 entries in {dataset[0]}:")
-    print(dataset[1][:3])
+    print(f"first 3 entries in {dataset.name}:")
+    print(dataset.dataset[:3])
 
-for dataset_name, dataset in datasets:
+for dataset in datasets:
     few_shot_prompts = create_few_shot_prompts(dataset)
-    print(f'{len(few_shot_prompts)} few-shot prompts created for {dataset.info.description}.')
+    print(f'{len(few_shot_prompts)} few-shot prompts created for {dataset.name}.')
     
-    responses = load_or_create_results(dataset_name, few_shot_prompts)
-    
-    # Calculate and print accuracy from cached results
-    correct = sum(1 for r in responses if r['is_correct'])
-    total = len(responses)
-    print(f"Accuracy: {correct}/{total} ({(correct/total)*100:.2f}%)")
+    responses = load_or_create_results(dataset, few_shot_prompts)
 
 
+
+# %%
 
 # %%
 
