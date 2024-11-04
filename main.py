@@ -2,31 +2,14 @@
 
 # research_pipeline.py
 import kagglehub
-import requests
 from dataclasses import dataclass
 from datasets import load_dataset, DatasetDict, Dataset
 from typing import List, Dict, Any, Optional, Union
 import json
 import random
 import openai
-import os
 from pathlib import Path
 import pandas as pd
-
-"""
-This script forms the high-level data pipeline for investigating how well an LLM can articulate in natural language rules that it uses for a classification task.
-
-The pipeline includes:
-- Dataset downloading or creation
-- Data preparation
-- Running classification experiments
-- Testing articulation of classification rules
-- Evaluating results
-"""
-
-from datasets import load_dataset, DatasetDict, Dataset
-from random import sample
-from typing import List
 from rich import print
 
 models = ["gpt-4o", "gpt-4o-mini"]
